@@ -20,3 +20,16 @@ if ('serviceWorker' in navigator) {
     navigator.serviceWorker.controller.postMessage({kind: evt, value: val});
   }
 }
+
+window.addEventListener('online', function() {
+  console.log.bind(console, 'normal online');
+  if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+    navigator.serviceWorker.controller.postMessage({kind: 'online'});
+  }
+});
+window.addEventListener('offline', function() {
+  console.log.bind(console, 'normal offline');
+  if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+    navigator.serviceWorker.controller.postMessage({kind: 'offline'});
+  }
+});

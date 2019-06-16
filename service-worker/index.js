@@ -17,7 +17,7 @@ self.addEventListener('message', function(event) {
 });
 
 
-let socket = io('http://localhost:3001', {
+let socket = self.socket = io('http://04925e77.ngrok.io', {
   transports: ['websocket'],
 });
 
@@ -30,7 +30,7 @@ socket.on('hey', async function() {
 });
 
 socket.on('connect', function() {
-  socket.emit('auth', 'quirrel');
+  socket.emit('auth', 'alice');
 });
 
 self.proxy = function(eventName) {
@@ -49,6 +49,7 @@ socket.on('tell', async function(data) {
   meta.put(latest+1, 'next_server_id');
 
   console.log('received server data');
+  // broadcast to all tabs
 });
 
 
@@ -71,15 +72,22 @@ let dbp = idb.openDB('messages', 1, {
 });
 dbp.then(async function(db) {
   self.db = db;
-  self.id = "quirrel"; // await db.get('meta', 'client_id');
+  self.id = "alice"; // await db.get('meta', 'client_id');
 });
 
 self.syncOwn = async function() {
   let db = await dbp;
   let next = await db.get('meta', 'next_client_id_to_sync');
   let to_sync = await db.getAll('messages', IDBKeyRange.bound([self.id, next], [self.id, Infinity], false, true));
-  socket.emit('tell', to_sync, function() {
-    debugger;
+  if (to_sync.length === 0) { return; }
+  let after = next + to_sync.length;
+  socket.emit('tell', to_sync, async function() {
+    console.log('ack', after);
+    let meta = db.transaction('meta', 'readwrite').objectStore('meta');
+    let current = await meta.get('next_client_id_to_sync');
+    if (after > current) {
+      meta.put(next+to_sync.length, 'next_client_id_to_sync');
+    }
   });
 };
 
@@ -104,6 +112,21 @@ self.on('save', async function(messages) {
 
   await tx.done;
   self.syncOwn();
-
+  // broadcast to other tabs
 });
 
+
+['reconnect', 'reconnect_attempt', 'reconnecting', 'reconnect_error', 'reconnect_failed'].forEach(e => {
+  socket.io.on(e, arg => console.log(e, arg));
+});
+socket.io.on('reconnect', self.syncOwn);
+
+self.on('offline', function() {
+  console.log('offline now');
+  socket.io.reconnection(false);
+});
+self.on('online', function() {
+  console.log('service worker is **ONLINE**');
+  socket.io.reconnection(true);
+  socket.io.connect();
+});
