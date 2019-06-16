@@ -30,16 +30,27 @@ socket.on('hey', async function() {
 });
 
 socket.on('connect', function() {
-  socket.emit('auth', 'karen');
+  socket.emit('auth', 'quirrel');
 });
 
 self.proxy = function(eventName) {
   self.on(eventName, (d) => socket.emit(eventName, d));
 };
 ['ask', 'tell', 'auth'].forEach(self.proxy);
-socket.on('tell', function(data) {
-  debugger;
+socket.on('tell', async function(data) {
+  let tx = self.db.transaction(['meta','messages'], 'readwrite');
+  let meta = tx.objectStore('meta');
+  let messages = tx.objectStore('messages');
+
+  data.forEach(m => messages.put(m));
+
+  let prev = await meta.get('next_server_id');
+  let latest = data.reduce((a,d)=>Math.max(a,d.server_index), prev-1);
+  meta.put(latest+1, 'next_server_id');
+
+  console.log('received server data');
 });
+
 
 self.on('message', function(e) {
   console.log('message from client', e.source.id);
@@ -54,20 +65,19 @@ let dbp = idb.openDB('messages', 1, {
       meta.add(0, 'next_client_id');
       meta.add(0, 'next_client_id_to_sync');
 
-      let msg = db.createObjectStore('messages', {autoIncrement: true});
-      msg.createIndex('by_client', ['client', 'client_index']);
+      let msg = db.createObjectStore('messages', {keyPath: ['client', 'client_index']});
     }
   }
 });
 dbp.then(async function(db) {
   self.db = db;
-  self.id = await db.get('meta', 'client_id');
+  self.id = "quirrel"; // await db.get('meta', 'client_id');
 });
 
 self.syncOwn = async function() {
   let db = await dbp;
   let next = await db.get('meta', 'next_client_id_to_sync');
-  let to_sync = await db.getAllFromIndex('messages', 'by_client', IDBKeyRange.bound([self.id, next], [self.id, Infinity], false, true));
+  let to_sync = await db.getAll('messages', IDBKeyRange.bound([self.id, next], [self.id, Infinity], false, true));
   socket.emit('tell', to_sync, function() {
     debugger;
   });
