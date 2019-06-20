@@ -1,8 +1,12 @@
-{{!-- The following component displays Ember's default welcome message. --}}
-<WelcomePage />
-{{!-- Feel free to remove this! --}}
+<ul>
+  {{#each data.messages as |msg|}}
+    <li>{{msg}}</li>
+  {{/each}}
+</ul>
 
-{{link-to 'home' 'index'}}
-{{link-to 'thing' 'thing'}}
+<form onsubmit={{action this.doThing}}>
+  {{input value=thing}}
+  <input type="submit">
+</form>
 
 {{outlet}}

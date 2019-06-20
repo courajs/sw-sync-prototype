@@ -19,6 +19,14 @@ if ('serviceWorker' in navigator) {
   window.send = function(evt, val) {
     navigator.serviceWorker.controller.postMessage({kind: evt, value: val});
   }
+
+  // firefox shuts down service worker after 30 seconds of idle,
+  // let's ping it frequently to prevent that
+  setInterval(function() {
+    if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+      navigator.serviceWorker.controller.postMessage({kind:'keepawake'});
+    }
+  }, 25000);
 }
 
 window.addEventListener('online', function() {
@@ -33,3 +41,5 @@ window.addEventListener('offline', function() {
     navigator.serviceWorker.controller.postMessage({kind: 'offline'});
   }
 });
+
+

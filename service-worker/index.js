@@ -16,8 +16,13 @@ self.addEventListener('message', function(event) {
   }
 });
 
+self.spam = async function(msg) {
+  let clients = await self.clients.matchAll({type:'window'});
+  clients.forEach(c => c.postMessage({kind:'update', value:[msg]}));
+}
 
-let socket = self.socket = io('http://04925e77.ngrok.io', {
+
+let socket = self.socket = io('http://localhost:3001', {
   transports: ['websocket'],
 });
 
@@ -29,8 +34,10 @@ socket.on('hey', async function() {
   cs.forEach(c => c.postMessage('hey from server'));
 });
 
-socket.on('connect', function() {
-  socket.emit('auth', 'alice');
+socket.on('connect', async function() {
+  let db = await dbp;
+  let name = await db.get('meta', 'client_id');
+  socket.emit('auth', name, self.syncRemote);
 });
 
 self.proxy = function(eventName) {
@@ -49,7 +56,8 @@ socket.on('tell', async function(data) {
   meta.put(latest+1, 'next_server_id');
 
   console.log('received server data');
-  // broadcast to all tabs
+  let clients = await self.clients.matchAll({type:'window'});
+  clients.forEach(c=>c.postMessage({kind:'update', value:data.map(d=>d.value)}));
 });
 
 
@@ -57,23 +65,33 @@ self.on('message', function(e) {
   console.log('message from client', e.source.id);
 });
 
-let dbp = idb.openDB('messages', 1, {
+let dbp = idb.openDB('messages', 2, {
   async upgrade(db, oldVersion, newVersion, tx) {
     if (oldVersion < 1) {
       let meta = db.createObjectStore('meta');
-      meta.add(Math.random().toString(), 'client_id');
+      meta.add('bob', 'client_id');
       meta.add(0, 'next_server_id');
       meta.add(0, 'next_client_id');
       meta.add(0, 'next_client_id_to_sync');
 
       let msg = db.createObjectStore('messages', {keyPath: ['client', 'client_index']});
     }
+    if (oldVersion < 2) {
+      tx.objectStore('messages').createIndex('uniq', ['client', 'client_index'], {unique: true});
+    }
   }
 });
 dbp.then(async function(db) {
   self.db = db;
-  self.id = "alice"; // await db.get('meta', 'client_id');
+  self.id = await db.get('meta', 'client_id'); // localStorage.name;// "alice"; // await db.get('meta', 'client_id');
+  console.log('id', self.id);
 });
+
+self.syncRemote = async function() {
+  let db = await dbp;
+  let next = await db.get('meta', 'next_server_id');
+  socket.emit('ask', next);
+};
 
 self.syncOwn = async function() {
   let db = await dbp;
@@ -120,6 +138,7 @@ self.on('save', async function(messages) {
   socket.io.on(e, arg => console.log(e, arg));
 });
 socket.io.on('reconnect', self.syncOwn);
+socket.io.on('reconnect', self.syncRemote);
 
 self.on('offline', function() {
   console.log('offline now');
@@ -127,6 +146,8 @@ self.on('offline', function() {
 });
 self.on('online', function() {
   console.log('service worker is **ONLINE**');
-  socket.io.reconnection(true);
-  socket.io.connect();
+  if (socket.io.readyState === 'closed') {
+    socket.io.reconnection(true);
+    socket.io.connect();
+  }
 });
