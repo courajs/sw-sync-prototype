@@ -12,8 +12,15 @@ self.addEventListener('message', function(event) {
     self.handlers.message.forEach(h => h(event));
   }
   if (event.data.kind && self.handlers[event.data.kind]) {
-    self.handlers[event.data.kind].forEach(h => h(event.data.value));
+    self.handlers[event.data.kind].forEach(h => h(event.data.value, event));
   }
+  if (typeof event.data === 'string' && event.data in self.handlers) {
+    self.handlers[event.data].forEach(h => h(event));
+  }
+});
+
+self.on('reset', function() {
+  self.syncRemote();
 });
 
 self.spam = async function(msg) {
@@ -22,7 +29,7 @@ self.spam = async function(msg) {
 }
 
 
-let socket = self.socket = io('http://localhost:3001', {
+let socket = self.socket = io('https://50b44399.ngrok.io', {
   transports: ['websocket'],
 });
 
@@ -35,9 +42,8 @@ socket.on('hey', async function() {
 });
 
 socket.on('connect', async function() {
-  let db = await dbp;
-  let name = await db.get('meta', 'client_id');
-  socket.emit('auth', name, self.syncRemote);
+  self.syncRemote();
+  self.syncOwn();
 });
 
 self.proxy = function(eventName) {
@@ -57,12 +63,12 @@ socket.on('tell', async function(data) {
 
   console.log('received server data');
   let clients = await self.clients.matchAll({type:'window'});
-  clients.forEach(c=>c.postMessage({kind:'update', value:data.map(d=>d.value)}));
+  clients.forEach(c=>c.postMessage({kind:'update', value:data}));
 });
 
 
 self.on('message', function(e) {
-  console.log('message from client', e.source.id);
+  console.log(e.data.kind, 'message from client', e.source.id);
 });
 
 let dbp = idb.openDB('messages', 2, {
@@ -114,7 +120,7 @@ self.on('init', async function(name) {
   return db.add('meta', name, 'name');
 });
 
-self.on('save', async function(messages) {
+self.on('save', async function(messages, event) {
   if (!Array.isArray(messages)) {
     messages = [messages];
   }
@@ -125,12 +131,30 @@ self.on('save', async function(messages) {
 
   let store = tx.objectStore('messages');
 
-  messages.forEach((msg, i) => store.add({client:self.id, client_index: prev+i, value: msg}));
+  let objs = messages.map((msg,i) => {return {client:self.id, client_index: prev+i, value: msg}});
+  objs.forEach(o => store.add(o));
+  // messages.forEach((msg, i) => store.add({client:self.id, client_index: prev+i, value: msg}));
   metastore.put(prev+messages.length, 'next_client_id');
 
   await tx.done;
   self.syncOwn();
+
   // broadcast to other tabs
+  let clients = await self.clients.matchAll({type:'window'});
+  for (let c of clients) {
+    if (c.id !== event.source.id) {
+      c.postMessage({kind:'update', value:objs});
+    }
+  }
+  // clients
+  //   .filter(c => c.id !== event.source.id)
+  //   .forEach(c => c.postMessage({kind:'update', value: objs}));
+  // for (let c of clients) {
+  //   debugger;
+  // }
+  // clients
+  //   .filter(c => event.source
+  //   forEach(c=>c.postMessage({kind:'update', value:data}));
 });
 
 
@@ -151,3 +175,5 @@ self.on('online', function() {
     socket.io.connect();
   }
 });
+
+

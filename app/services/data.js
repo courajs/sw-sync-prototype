@@ -1,44 +1,63 @@
 import Service from '@ember/service';
 import {computed} from '@ember/object';
 import {openDB, unwrap} from 'idb';
+import {timeout} from 'ember-concurrency';
+
+let local_index = 0;
 
 export default Service.extend({
-  messages: [],
+  _items: null, // item Map
+  _locals: null, // local items (don't have client_index)
   async init() {
     navigator.serviceWorker.addEventListener('message', (event) => {
       console.log('update?', event);
       if (event.data.kind === 'update') {
-        this.set('messages', this.messages.concat(event.data.value));
+        this._update(event.data.value);
       }
     });
 
-    let db = await openDB('messages', 2, {
-      async upgrade(db, oldVersion, newVersion, tx) {
-        if (oldVersion < 1) {
-          let meta = db.createObjectStore('meta');
-          meta.add(Math.random().toString(), 'client_id');
-          meta.add(0, 'next_server_id');
-          meta.add(0, 'next_client_id');
-          meta.add(0, 'next_client_id_to_sync');
+    this._items = new Map();
+    this._locals = [];
 
-          let msg = db.createObjectStore('messages', {keyPath: ['client', 'client_index']});
-        }
-        if (oldVersion < 2) {
-          tx.objectStore('messages').createIndex('uniq', ['client', 'client_index'], {unique: true});
-        }
-    }});
-    let msgs = await db.getAll('messages');
+    // await timeout(4000);
+    let db = await openDB('messages', 2);
+    let messages = await db.getAll('messages');
 
-    this.set('messages', msgs.map(m=>m.value));
+    for (let m of messages) {
+      this._items.set(m.client+':'+m.client_index, m);
+    }
+    this.notifyPropertyChange('_items');
   },
 
+  messages: computed('_items', '_locals', function() {
+    return Array.from(this._items, ([k,v]) => v.value).concat(this._locals).sort();
+  }),
+
   save(messages) {
+    if (!messages) { return; }
+    if (!Array.isArray(messages)) {
+      messages = [messages];
+    } else if (!messages.length) { return; }
+
     navigator.serviceWorker.controller.postMessage({
       kind: 'save',
       value: messages,
     });
-    this.set('messages', this.messages.concat(messages));
-  }
+    this.set('_locals', this._locals.concat(messages));
+  },
+
+  _update(notified) {
+    let dirty = false;
+    for (let item of notified) {
+      if (!this._items.has(item.client+':'+item.client_index)) {
+        dirty = true;
+        this._items.set(item.client+':'+item.client_index, item);
+      }
+    }
+    if (dirty) {
+      this.notifyPropertyChange('_items');
+    }
+  },
 });
 
 
@@ -74,6 +93,7 @@ window.resetDB = async function() {
   meta.put(0, 'next_server_id');
   meta.put(0, 'next_client_id');
   meta.put(0, 'next_client_id_to_sync');
-}
 
-setTimeout(window.pushThing, 1000);
+  await tx.done;
+  navigator.serviceWorker.controller.postMessage('reset');
+}
