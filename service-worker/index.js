@@ -2,19 +2,21 @@ importScripts('https://unpkg.com/socket.io-client@2.2.0/dist/socket.io.slim.dev.
 importScripts('https://unpkg.com/idb@4.0.3/build/iife/index-min.js');
 
 
-self.addEventListener('activate', () => console.log('ACTIVATE'));
-
-self.clients.matchAll().then(a=>{
-  console.log('starting sw, controlling',a,'clients',new Date());
-  console.log(self.registration);
-});
-
-
 // events from connected client tabs
 self.handlers = {};
 self.on = function(ev, handler) {
   self.handlers[ev] = self.handlers[ev] || [];
   self.handlers[ev].push(handler);
+}
+self.once = function(ev, handler) {
+  let skip = false;
+  self.handlers[ev] = self.handlers[ev] || [];
+  self.handlers[ev].push((...args) => {
+    if (!skip) {
+      skip = true;
+      handler(...args);
+    }
+  });
 }
 self.addEventListener('message', function(event) {
   if (self.handlers.message) {
@@ -45,83 +47,66 @@ async function upgrade(db, oldVersion, newVersion, tx) {
     tx.objectStore('messages').createIndex('uniq', ['client', 'client_index'], {unique: true});
   }
 }
-self.dbp = idb.openDB('messages', DB_VERSION, {upgrade});
 
 
-
-self.on('reset', function() {
-  self.syncRemote();
-});
-
-self.spam = async function(msg) {
-  let clients = await self.clients.matchAll({type:'window'});
-  clients.forEach(c => c.postMessage({kind:'update', value:[msg]}));
-}
-
-
-let socket = self.socket = io('http://localhost:3001', {
-  transports: ['websocket'],
-});
-
-socket.on('hey', async function() {
-  let cs = await self.clients.matchAll({
-    type: 'window'
+// we want to avoid opening websockets and such for not-yet-active
+// service workers. buuuut you can't actually tell from inside the
+// service worker whether you're active or not. you can listen to
+// the 'activate' event, but that only fires once, *ever*, per sw.
+// the sw can be shut down due to no open tabs, then run again later,
+// and have no way to tell that it's already been activated.
+// so, we just ping from every active tab when they first start up,
+// and that will trigger socket initialization in the sw if necessary.
+self.dbp = new Promise(function(resolve) {
+  self.once('init', function() {
+    console.log('init db!!');
+    let db = idb.openDB('messages', DB_VERSION, {upgrade});
+    self.db = db;
+    resolve(db);
   });
-
-  cs.forEach(c => c.postMessage('hey from server'));
 });
-
-socket.on('connect', async function() {
-  self.syncRemote();
-  self.syncOwn();
+self.pock = new Promise(function(resolve) {
+  self.once('init', function() {
+    console.log('init socket!!');
+    let socket = io('http://localhost:3001', {transports:['websocket']});
+    self.socket = socket;
+    resolve(socket);
+  });
 });
-
-self.proxy = function(eventName) {
-  self.on(eventName, (d) => socket.emit(eventName, d));
-};
-['ask', 'tell', 'auth'].forEach(self.proxy);
-socket.on('tell', async function(data) {
-  let tx = self.db.transaction(['meta','messages'], 'readwrite');
-  let meta = tx.objectStore('meta');
-  let messages = tx.objectStore('messages');
-
-  data.forEach(m => messages.put(m));
-
-  let prev = await meta.get('next_server_id');
-  let latest = data.reduce((a,d)=>Math.max(a,d.server_index), prev-1);
-  meta.put(latest+1, 'next_server_id');
-
-  console.log('received server data');
-  let clients = await self.clients.matchAll({type:'window'});
-  clients.forEach(c=>c.postMessage({kind:'update', value:data}));
-});
+self.pid = self.dbp.then((db) => db.get('meta', 'client_id'));
 
 
-self.on('message', function(e) {
-  console.log(e.data.kind, 'message from client', e.source.id);
-});
+self.dbp.catch((e) => console.log("error opening db in service worker!", e));
+self.pock.catch((e) => console.log("error opening socket.io connection in service worker!", e));
 
-let dbp = idb.openDB('messages', DB_VERSION, {upgrade});
 
-dbp.then(async function(db) {
-  self.db = db;
-  self.id = await db.get('meta', 'client_id'); // localStorage.name;// "alice"; // await db.get('meta', 'client_id');
-  console.log('id', self.id);
-});
+// data sync logic
 
-self.syncRemote = async function() {
-  let db = await dbp;
-  let next = await db.get('meta', 'next_server_id');
-  socket.emit('ask', next);
-};
-
+// sync our own data down to the server.
+// we keep track of the most recently acknowledged message
+// in our 'meta' object store, as 'next_client_id_to_sync'.
+// keeping track of the next one instead of currently acknowledged
+// means we can just initialize it to 0, instead of adding the edge
+// case of null or -1.
 self.syncOwn = async function() {
-  let db = await dbp;
+  let db = await self.dbp;
+  let socket = await self.pock;
+  let client_id = await self.pid;
+
   let next = await db.get('meta', 'next_client_id_to_sync');
-  let to_sync = await db.getAll('messages', IDBKeyRange.bound([self.id, next], [self.id, Infinity], false, true));
+  // get all of our messages with client_index >= next
+  let range = IDBKeyRange.bound([client_id, next], [client_id, Infinity], false, true);
+  let to_sync = await db.getAll('messages', range);
+  // nothing new to send
   if (to_sync.length === 0) { return; }
+
+  // the "new next" if this write goes through
   let after = next + to_sync.length;
+
   socket.emit('tell', to_sync, async function() {
+    // when this write is acknowledged, we update meta, but check
+    // (within a transaction) whether a concurrent write might have beaten
+    // us to it. this prevents us from 'un-acknowledging' something.
     console.log('ack', after);
     let meta = db.transaction('meta', 'readwrite').objectStore('meta');
     let current = await meta.get('next_client_id_to_sync');
@@ -131,25 +116,83 @@ self.syncOwn = async function() {
   });
 };
 
-self.on('init', async function(name) {
-  let db = await dbp;
-  return db.add('meta', name, 'name');
+// all the hard stuff is in the 'tell' listener
+self.syncRemote = async function() {
+  let db = await self.dbp;
+  let socket = await self.pock;
+  let next = await db.get('meta', 'next_server_id');
+  socket.emit('ask', next);
+};
+
+self.syncAll = () => Promise.all([self.syncRemote(), self.syncOwn()]);
+
+// ok, we add all the messages we hear from the server to our database.
+// we use put, so adding the same data a second time has no effect.
+// we also update 'next_server_id' so we know what to ask for next time
+// we query for updates.
+// finally, we broadcast the data to all connected tabs. at the moment
+// they'll have to de-duplicate for themselves. maybe we should handle
+// that here.
+self.handleTell = async function(data) {
+  let db = await self.dbp;
+
+  let tx = db.transaction(['meta','messages'], 'readwrite');
+  let meta = tx.objectStore('meta');
+  let messages = tx.objectStore('messages');
+
+  data.forEach(m => messages.put(m));
+
+  let prev = await meta.get('next_server_id');
+  let latest = data.reduce((a,d)=>Math.max(a,d.server_index), prev-1);
+  meta.put(latest+1, 'next_server_id');
+
+  let clients = await self.clients.matchAll({type:'window'});
+  clients.forEach(c=>c.postMessage({kind:'update', value:data}));
+};
+
+
+self.pock.then((socket) => {
+  socket.on('connect', self.syncAll);
+  socket.on('reconnect', self.syncAll);
+  socket.on('tell', self.handleTell);
+
+  // don't spam reconnection attempts if we don't have network
+  self.on('offline', () => socket.io.reconnection(false));
+  // try to reconnect immediately when we know we got network back
+  self.on('online', () => {
+    if (socket.io.readyState === 'closed') {
+      socket.io.connect();
+    }
+    socket.io.reconnection(true);
+  });
+
+  ['reconnect', 'reconnect_attempt', 'reconnecting', 'reconnect_error', 'reconnect_failed'].forEach(e => {
+    socket.io.on(e, arg => console.log(e, arg));
+  });
 });
 
 self.on('save', async function(messages, event) {
-  if (!Array.isArray(messages)) {
+  if (!messages) {
+    return;
+  } else if (Array.isArray(messages) && messages.length === 0) {
+    return;
+  } else if (!Array.isArray(messages)) {
     messages = [messages];
   }
-  let db = await dbp;
+
+  let db = await self.dbp;
+  let client_id = await self.pid;
+  let socket = await self.pock;
+
   let tx = db.transaction(['meta', 'messages'], 'readwrite');
   let metastore = tx.objectStore('meta');
   let prev = await metastore.get('next_client_id');
 
   let store = tx.objectStore('messages');
 
-  let objs = messages.map((msg,i) => {return {client:self.id, client_index: prev+i, value: msg}});
+  // we save these objects to idb, ship them to the backend, and broadcast them to other tabs
+  let objs = messages.map((msg,i) => {return {client:client_id, client_index: prev+i, value: msg}});
   objs.forEach(o => store.add(o));
-  // messages.forEach((msg, i) => store.add({client:self.id, client_index: prev+i, value: msg}));
   metastore.put(prev+messages.length, 'next_client_id');
 
   await tx.done;
@@ -162,34 +205,4 @@ self.on('save', async function(messages, event) {
       c.postMessage({kind:'update', value:objs});
     }
   }
-  // clients
-  //   .filter(c => c.id !== event.source.id)
-  //   .forEach(c => c.postMessage({kind:'update', value: objs}));
-  // for (let c of clients) {
-  //   debugger;
-  // }
-  // clients
-  //   .filter(c => event.source
-  //   forEach(c=>c.postMessage({kind:'update', value:data}));
 });
-
-
-['reconnect', 'reconnect_attempt', 'reconnecting', 'reconnect_error', 'reconnect_failed'].forEach(e => {
-  socket.io.on(e, arg => console.log(e, arg));
-});
-socket.io.on('reconnect', self.syncOwn);
-socket.io.on('reconnect', self.syncRemote);
-
-self.on('offline', function() {
-  console.log('offline now');
-  socket.io.reconnection(false);
-});
-self.on('online', function() {
-  console.log('service worker is **ONLINE**');
-  if (socket.io.readyState === 'closed') {
-    socket.io.reconnection(true);
-    socket.io.connect();
-  }
-});
-
-
