@@ -30,7 +30,9 @@ export default Service.extend({
   },
 
   messages: computed('_items', '_locals', function() {
-    return Array.from(this._items, ([k,v]) => v.value).concat(this._locals).sort();
+    return Array.from(this._items, ([k,v]) => v.value).concat(this._locals).sort(function(a, b) {
+      return a.time - b.time;
+    });
   }),
 
   save(messages) {

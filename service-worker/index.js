@@ -29,7 +29,7 @@ self.spam = async function(msg) {
 }
 
 
-let socket = self.socket = io('https://50b44399.ngrok.io', {
+let socket = self.socket = io('http://localhost:3001', {
   transports: ['websocket'],
 });
 
