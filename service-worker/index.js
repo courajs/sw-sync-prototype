@@ -2,6 +2,15 @@ importScripts('https://unpkg.com/socket.io-client@2.2.0/dist/socket.io.slim.dev.
 importScripts('https://unpkg.com/idb@4.0.3/build/iife/index-min.js');
 
 
+self.addEventListener('activate', () => console.log('ACTIVATE'));
+
+self.clients.matchAll().then(a=>{
+  console.log('starting sw, controlling',a,'clients',new Date());
+  console.log(self.registration);
+});
+
+
+// events from connected client tabs
 self.handlers = {};
 self.on = function(ev, handler) {
   self.handlers[ev] = self.handlers[ev] || [];
@@ -18,6 +27,27 @@ self.addEventListener('message', function(event) {
     self.handlers[event.data].forEach(h => h(event));
   }
 });
+
+
+// set up indexedDB instance
+const DB_VERSION = 2;
+async function upgrade(db, oldVersion, newVersion, tx) {
+  if (oldVersion < 1) {
+    let meta = db.createObjectStore('meta');
+    meta.add('bob', 'client_id');
+    meta.add(0, 'next_server_id');
+    meta.add(0, 'next_client_id');
+    meta.add(0, 'next_client_id_to_sync');
+
+    let msg = db.createObjectStore('messages', {keyPath: ['client', 'client_index']});
+  }
+  if (oldVersion < 2) {
+    tx.objectStore('messages').createIndex('uniq', ['client', 'client_index'], {unique: true});
+  }
+}
+self.dbp = idb.openDB('messages', DB_VERSION, {upgrade});
+
+
 
 self.on('reset', function() {
   self.syncRemote();
@@ -71,22 +101,8 @@ self.on('message', function(e) {
   console.log(e.data.kind, 'message from client', e.source.id);
 });
 
-let dbp = idb.openDB('messages', 2, {
-  async upgrade(db, oldVersion, newVersion, tx) {
-    if (oldVersion < 1) {
-      let meta = db.createObjectStore('meta');
-      meta.add('bob', 'client_id');
-      meta.add(0, 'next_server_id');
-      meta.add(0, 'next_client_id');
-      meta.add(0, 'next_client_id_to_sync');
+let dbp = idb.openDB('messages', DB_VERSION, {upgrade});
 
-      let msg = db.createObjectStore('messages', {keyPath: ['client', 'client_index']});
-    }
-    if (oldVersion < 2) {
-      tx.objectStore('messages').createIndex('uniq', ['client', 'client_index'], {unique: true});
-    }
-  }
-});
 dbp.then(async function(db) {
   self.db = db;
   self.id = await db.get('meta', 'client_id'); // localStorage.name;// "alice"; // await db.get('meta', 'client_id');

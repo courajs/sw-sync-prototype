@@ -3,12 +3,30 @@ import {computed} from '@ember/object';
 import {openDB, unwrap} from 'idb';
 import {timeout} from 'ember-concurrency';
 
-let local_index = 0;
+const DB_VERSION = 2;
+async function upgrade(db, oldVersion, newVersion, tx) {
+  if (oldVersion < 1) {
+    let meta = db.createObjectStore('meta');
+    meta.add('bob', 'client_id');
+    meta.add(0, 'next_server_id');
+    meta.add(0, 'next_client_id');
+    meta.add(0, 'next_client_id_to_sync');
+
+    let msg = db.createObjectStore('messages', {keyPath: ['client', 'client_index']});
+  }
+  if (oldVersion < 2) {
+    tx.objectStore('messages').createIndex('uniq', ['client', 'client_index'], {unique: true});
+  }
+}
 
 export default Service.extend({
   _items: null, // item Map
-  _locals: null, // local items (don't have client_index)
+  _tab_local_items: null, // local items (don't have client_index)
+
   async init() {
+    this._items = new Map();
+    this._tab_local_items = [];
+
     navigator.serviceWorker.addEventListener('message', (event) => {
       console.log('update?', event);
       if (event.data.kind === 'update') {
@@ -17,10 +35,10 @@ export default Service.extend({
     });
 
     this._items = new Map();
-    this._locals = [];
+    this._tab_local_items = [];
 
     // await timeout(4000);
-    let db = await openDB('messages', 2);
+    let db = await openDB('messages', DB_VERSION, {upgrade});
     let messages = await db.getAll('messages');
 
     for (let m of messages) {
@@ -29,8 +47,8 @@ export default Service.extend({
     this.notifyPropertyChange('_items');
   },
 
-  messages: computed('_items', '_locals', function() {
-    return Array.from(this._items, ([k,v]) => v.value).concat(this._locals).sort(function(a, b) {
+  messages: computed('_items', '_tab_local_items', function() {
+    return Array.from(this._items, ([k,v]) => v.value).concat(this._tab_local_items).sort(function(a, b) {
       return a.time - b.time;
     });
   }),
@@ -45,7 +63,7 @@ export default Service.extend({
       kind: 'save',
       value: messages,
     });
-    this.set('_locals', this._locals.concat(messages));
+    this.set('_tab_local_items', this._tab_local_items.concat(messages));
   },
 
   _update(notified) {
