@@ -8,7 +8,7 @@ addSuccessHandler(function(reg) {
 
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.ready.then(function(reg) {
-    let send = (evt) => navigator.serviceWorker.controller.postMessage({kind:evt});
+    let send = (kind,value) => navigator.serviceWorker.controller.postMessage({kind,value});
 
     // we want to avoid opening websockets and such for not-yet-active
     // service workers. buuuut you can't actually tell from inside the
@@ -28,9 +28,12 @@ if ('serviceWorker' in navigator) {
     // firefox shuts down service workers after 30 seconds of idle.
     // but, we want it to keep the socket open in case of server events
     setInterval(() => send('keepawake'), 25000);
+
+    window.auth = (name) => send('auth', name);
   });
 
   navigator.serviceWorker.addEventListener('controllerchange', () => console.log('controller change'));
+
 } else {
   console.error("serviceWorkers are kinda necessary for this app!");
 }

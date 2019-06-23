@@ -30,9 +30,8 @@ self.addEventListener('message', function(event) {
   }
 });
 
-
-// set up indexedDB instance
-const DB_VERSION = 2;
+// indexedDB configuration
+const DB_VERSION = 3;
 async function upgrade(db, oldVersion, newVersion, tx) {
   if (oldVersion < 1) {
     let meta = db.createObjectStore('meta');
@@ -45,6 +44,12 @@ async function upgrade(db, oldVersion, newVersion, tx) {
   }
   if (oldVersion < 2) {
     tx.objectStore('messages').createIndex('uniq', ['client', 'client_index'], {unique: true});
+  }
+  if (oldVersion < 3) {
+    let m = tx.objectStore('messages');
+    m.deleteIndex('uniq');
+    m.createIndex('by_client', ['client', 'client_index'], {unique: true});
+    m.createIndex('by_server', 'server_index', {unique:true});
   }
 }
 
@@ -166,43 +171,32 @@ self.pock.then((socket) => {
     socket.io.reconnection(true);
   });
 
-  ['reconnect', 'reconnect_attempt', 'reconnecting', 'reconnect_error', 'reconnect_failed'].forEach(e => {
+  ['connect', 'reconnect', 'reconnect_attempt', 'reconnecting', 'reconnect_error', 'reconnect_failed'].forEach(e => {
     socket.io.on(e, arg => console.log(e, arg));
   });
 });
 
-self.on('save', async function(messages, event) {
-  if (!messages) {
-    return;
-  } else if (Array.isArray(messages) && messages.length === 0) {
-    return;
-  } else if (!Array.isArray(messages)) {
-    messages = [messages];
-  }
-
-  let db = await self.dbp;
-  let client_id = await self.pid;
-  let socket = await self.pock;
-
-  let tx = db.transaction(['meta', 'messages'], 'readwrite');
-  let metastore = tx.objectStore('meta');
-  let prev = await metastore.get('next_client_id');
-
-  let store = tx.objectStore('messages');
-
-  // we save these objects to idb, ship them to the backend, and broadcast them to other tabs
-  let objs = messages.map((msg,i) => {return {client:client_id, client_index: prev+i, value: msg}});
-  objs.forEach(o => store.add(o));
-  metastore.put(prev+messages.length, 'next_client_id');
-
-  await tx.done;
-  self.syncOwn();
-
+self.on('update', async function(messages, event) {
   // broadcast to other tabs
   let clients = await self.clients.matchAll({type:'window'});
   for (let c of clients) {
     if (c.id !== event.source.id) {
-      c.postMessage({kind:'update', value:objs});
+      c.postMessage({kind:'update'});
     }
   }
+  
+  // send update to server
+  self.syncOwn();
 });
+
+self.auth = async function(name) {
+  let db = await self.dbp;
+  db.transaction('meta','readwrite').objectStore('meta').put(name, 'client_id');
+  await fetch('http://localhost:3001/auth',{method: 'POST', mode:'no-cors',credentials:'include', body:name});
+  let socket = await self.pock;
+  socket.disconnect();
+  socket.connect();
+}
+
+self.on('auth', self.auth);
+
