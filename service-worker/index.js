@@ -157,8 +157,8 @@ self.handleTell = async function(data) {
 
 
 self.pock.then((socket) => {
+  // includes reconnect, apparently
   socket.on('connect', self.syncAll);
-  socket.on('reconnect', self.syncAll);
   socket.on('tell', self.handleTell);
 
   // don't spam reconnection attempts if we don't have network
