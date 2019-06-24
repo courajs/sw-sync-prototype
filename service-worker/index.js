@@ -31,26 +31,25 @@ self.addEventListener('message', function(event) {
 });
 
 // indexedDB configuration
-const DB_VERSION = 3;
+const DB_VERSION = 10;
 async function upgrade(db, oldVersion, newVersion, tx) {
-  if (oldVersion < 1) {
-    let meta = db.createObjectStore('meta');
-    meta.add('bob', 'client_id');
-    meta.add(0, 'next_server_id');
-    meta.add(0, 'next_client_id');
-    meta.add(0, 'next_client_id_to_sync');
+  [].forEach.call(db.objectStoreNames, n => db.deleteObjectStore(n));
 
-    let msg = db.createObjectStore('messages', {keyPath: ['client', 'client_index']});
-  }
-  if (oldVersion < 2) {
-    tx.objectStore('messages').createIndex('uniq', ['client', 'client_index'], {unique: true});
-  }
-  if (oldVersion < 3) {
-    let m = tx.objectStore('messages');
-    m.deleteIndex('uniq');
-    m.createIndex('by_client', ['client', 'client_index'], {unique: true});
-    m.createIndex('by_server', 'server_index', {unique:true});
-  }
+  let meta = db.createObjectStore('meta');
+
+  let clocks = db.createObjectStore('clocks', {keyPath:'collection'});
+  clocks.createIndex('uniq', 'collection', {unique: true});
+  clocks.add({
+    collection: 'index',
+    synced_remote: 0,
+    synced_local: 0,
+    last_local: 0,
+  });
+
+  let m = db.createObjectStore('messages',
+      {keyPath: ['collection', 'client', 'client_index']});
+  m.createIndex('primary', ['collection', 'client', 'client_index'], {unique: true});
+  m.createIndex('remote', ['collection', 'server_index'], {unique:true});
 }
 
 
@@ -86,73 +85,95 @@ self.pock.catch((e) => console.log("error opening socket.io connection in servic
 
 
 // data sync logic
+//
 
 // sync our own data down to the server.
 // we keep track of the most recently acknowledged message
-// in our 'meta' object store, as 'next_client_id_to_sync'.
-// keeping track of the next one instead of currently acknowledged
-// means we can just initialize it to 0, instead of adding the edge
-// case of null or -1.
+// for each collection in our 'clocks' object store.
+// so, check them all for last_local > synced_local.
 self.syncOwn = async function() {
   let db = await self.dbp;
   let socket = await self.pock;
   let client_id = await self.pid;
 
-  let next = await db.get('meta', 'next_client_id_to_sync');
-  // get all of our messages with client_index >= next
-  let range = IDBKeyRange.bound([client_id, next], [client_id, Infinity], false, true);
-  let to_sync = await db.getAll('messages', range);
-  // nothing new to send
-  if (to_sync.length === 0) { return; }
+  let tx = db.transaction(['clocks', 'messages']);
+  let clocks = await tx.objectStore('clocks').getAll();
+  let messages = tx.objectStore('messages');
 
-  // the "new next" if this write goes through
-  let after = next + to_sync.length;
+  let if_acked = {};
 
-  socket.emit('tell', to_sync, async function() {
-    // when this write is acknowledged, we update meta, but check
-    // (within a transaction) whether a concurrent write might have beaten
-    // us to it. this prevents us from 'un-acknowledging' something.
-    console.log('ack', after);
-    let meta = db.transaction('meta', 'readwrite').objectStore('meta');
-    let current = await meta.get('next_client_id_to_sync');
-    if (after > current) {
-      meta.put(next+to_sync.length, 'next_client_id_to_sync');
+  let reqs = clocks
+    .filter(c=>c.last_local>c.synced_local) // collections with new data to sync
+    .map(c => {
+      if_acked[c.collection] = c.last_local;
+      let from = [c.collection, client_id, c.synced_local];
+      let to = [c.collection,client_id,c.last_local];
+      return messages.getAll(IDBKeyRange.bound(from,to,true,false));
+    }); // everyting after synced_local, for that collection
+
+  let sets = await Promise.all(reqs);
+  if (sets.length === 0) { return; }
+
+  socket.emit('tell', [].concat(...sets), async function() {
+    console.log('ack', if_acked);
+    let tx = db.transaction(['clocks'], 'readwrite');
+    let clocks = tx.objectStore('clocks');
+    let current_clocks = await Promise.all(Object.keys(if_acked).map(collection => clocks.get(collection)));
+    for (let c of current_clocks) {
+      c.synced_local = Math.max(c.synced_local, if_acked[c.collection]);
+      clocks.put(c);
     }
   });
 };
 
-// all the hard stuff is in the 'tell' listener
+// server replies with a 'tell' event, so most of the hard stuff
+// is in there
 self.syncRemote = async function() {
   let db = await self.dbp;
   let socket = await self.pock;
-  let next = await db.get('meta', 'next_server_id');
-  socket.emit('ask', next);
+  let clocks = await db.getAll('clocks');
+  let ask = {};
+  clocks.forEach(c => ask[c.collection] = c.synced_remote);
+  socket.emit('ask', ask);
 };
 
 self.syncAll = () => Promise.all([self.syncRemote(), self.syncOwn()]);
 
 // ok, we add all the messages we hear from the server to our database.
 // we use put, so adding the same data a second time has no effect.
-// we also update 'next_server_id' so we know what to ask for next time
+// we also update clocks so we know what to ask for next time
 // we query for updates.
-// finally, we broadcast the data to all connected tabs. at the moment
-// they'll have to de-duplicate for themselves. maybe we should handle
-// that here.
+// finally, we broadcast that there's an update to all connected tabs.
+// they're responsible for reading from indexeddb themselves
 self.handleTell = async function(data) {
   let db = await self.dbp;
+  let client_id = await self.pid;
 
-  let tx = db.transaction(['meta','messages'], 'readwrite');
-  let meta = tx.objectStore('meta');
+  let tx = db.transaction(['clocks','messages'], 'readwrite');
   let messages = tx.objectStore('messages');
 
-  data.forEach(m => messages.put(m));
+  // save the messages, and keep track of the max server_index for each collection
+  let latests = {};
+  for (let d of data) {
+    messages.put(d);
+    if (d.collection in latests) {
+      latests[d.collection] = Math.max(latests[d.collection], d.server_index);
+    } else {
+      latests[d.collection] = d.server_index;
+    }
+  }
 
-  let prev = await meta.get('next_server_id');
-  let latest = data.reduce((a,d)=>Math.max(a,d.server_index), prev-1);
-  meta.put(latest+1, 'next_server_id');
+  // update clocks for each collection
+  let clocks = tx.objectStore('clocks');
+  let current_clocks = await Promise.all(Object.keys(latests).map(collection => clocks.get(collection)));
+  for (let c of current_clocks) {
+    c.synced_remote = Math.max(c.synced_remote, latests[c.collection]);
+    clocks.put(c);
+  }
 
+  // notify connected tabs
   let clients = await self.clients.matchAll({type:'window'});
-  clients.forEach(c=>c.postMessage({kind:'update', value:data}));
+  clients.forEach(c=>c.postMessage({kind:'update'}));
 };
 
 
@@ -172,7 +193,7 @@ self.pock.then((socket) => {
   });
 
   ['connect', 'reconnect', 'reconnect_attempt', 'reconnecting', 'reconnect_error', 'reconnect_failed'].forEach(e => {
-    socket.io.on(e, arg => console.log(e, arg));
+    // socket.io.on(e, arg => console.log(e, arg));
   });
 });
 

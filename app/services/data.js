@@ -1,189 +1,150 @@
 import Service from '@ember/service';
-import {computed} from '@ember/object';
+import EmberObject, {computed} from '@ember/object';
 import {openDB, unwrap} from 'idb';
 import {task, timeout} from 'ember-concurrency';
 
 const DB_NAME = 'messages';
-const DB_VERSION = 3;
+const DB_VERSION = 10;
 async function upgrade(db, oldVersion, newVersion, tx) {
-  if (oldVersion < 1) {
-    let meta = db.createObjectStore('meta');
-    meta.add('bob', 'client_id');
-    meta.add(0, 'next_server_id');
-    meta.add(0, 'next_client_id');
-    meta.add(0, 'next_client_id_to_sync');
+  [].forEach.call(db.objectStoreNames, n => db.deleteObjectStore(n));
 
-    let msg = db.createObjectStore('messages', {keyPath: ['client', 'client_index']});
-  }
-  if (oldVersion < 2) {
-    tx.objectStore('messages').createIndex('uniq', ['client', 'client_index'], {unique: true});
-  }
+  let meta = db.createObjectStore('meta');
 
-  if (oldVersion < 3) {
-    let m = tx.objectStore('messages');
-    m.deleteIndex('uniq');
-    m.createIndex('by_client', ['client', 'client_index'], {unique: true});
-    m.createIndex('by_server', 'server_index', {unique:true});
-  }
+  let clocks = db.createObjectStore('clocks', {keyPath:'collection'});
+  clocks.createIndex('uniq', 'collection', {unique: true});
+  clocks.add({
+    collection: 'index',
+    synced_remote: 0,
+    synced_local: 0,
+    last_local: 0,
+  });
+
+  let m = db.createObjectStore('messages',
+      {keyPath: ['collection', 'client', 'client_index']});
+  m.createIndex('primary', ['collection', 'client', 'client_index'], {unique: true});
+  m.createIndex('remote', ['collection', 'server_index'], {unique:true});
+}
+const getDB = () => openDB(DB_NAME, DB_VERSION, {upgrade});
+
+
+async function getFromCollection(db, collection, since) {
+  let {local,remote} = since;
+  let tx = db.transaction(['meta', 'clocks', 'messages']);
+  let client_id = await tx.objectStore('meta').get('client_id');
+  let messages = tx.objectStore('messages');
+
+  let local_from = [collection, client_id, local];
+  let local_to = [collection, client_id, Infinity];
+  let locals = messages.index('primary').getAll(IDBKeyRange.bound(local_from, local_to, true, true)); // exclusive range
+
+  let remote_from = [collection, remote];
+  let remote_to = [collection, Infinity];
+  let remotes = messages.index('remote').getAll(IDBKeyRange.bound(remote_from, remote_to, true, true));
+
+  let clock = await tx.objectStore('clocks').get(collection);
+  locals = await locals;
+  remotes = await remotes;
+  return {
+    clock: {local: clock.last_local, remote: clock.synced_remote},
+    values: locals.concat(remotes).map(d=>d.value),
+  };
 }
 
-class DataStore {
-  static async open() {
-    return new this(await openDB(DB_NAME, DB_VERSION, {upgrade}));
-  }
+async function writeToCollection(db, collection, items) {
+  let tx = db.transaction(['meta', 'clocks', 'messages'], 'readwrite');
+  let client_id = await tx.objectStore('meta').get('client_id');
+  let clock = await tx.objectStore('clocks').get(collection);
+  let msg_store = tx.objectStore('messages');
 
-  constructor(db) {
-    this.db = db;
-  }
-
-  read() {
-    return new ReadTransaction(this.db.transaction(['messages','meta']));
-  }
-  write() {
-    return new WriteTransaction(this.db.transaction(['messages','meta'],'readwrite'));
-  }
-}
-
-class ReadTransaction {
-  constructor(tx) {
-    this.tx = tx;
-    this.done = tx.done;
-  }
-
-  tables() {
+  let messages = items.map(v => {
     return {
-      meta: this.tx.objectStore('meta'),
-      messages: this.tx.objectStore('messages'),
+      collection,
+      client: client_id,
+      client_index: ++clock.last_local,
+      value: v,
     };
-  }
+  })
+  .forEach(i => msg_store.add(i));
 
-  async meta() {
-    let result = {};
-    let cursor = await this.tx.objectStore('meta').openCursor();
-    while (cursor) {
-      result[cursor.key] = cursor.value;
-      cursor = await cursor.continue();
-    }
-    result.clock = [result.next_client_id, result.next_server_id];
-    return result;
-  }
-
-  async id() {
-    return this.tx.objectStore('meta').get('client_id');
-  }
-
-  async all() {
-    let [clock, all] = Promise.all([
-        this.clock(),
-        this.tx.objectStore('messages').getAll(),
-    ]);
-
-    return {
-      clock,
-      values: all.map(messages.map(m=>m.value)),
-    };
-  }
-
-  async since([local_index,remote_index]) {
-    let meta = await this.meta();
-    let id = meta.client_id;
-
-    let client_range = IDBKeyRange.bound([id,local_index], [id,Infinity]);
-    let server_range = IDBKeyRange.lowerBound(remote_index);
-    let messages = this.tx.objectStore('messages');
-    let local = messages.index('by_client').getAll(client_range);
-    let remote = messages.index('by_server').getAll(server_range);
-
-    [local,remote] = await Promise.all([local,remote]);
-    return {
-      clock: meta.clock,
-      values: local.concat(remote).map(d=>d.value),
-    };
-  }
+  tx.objectStore('clocks').put(clock);
+  return tx.done;
 }
 
-class WriteTransaction extends ReadTransaction {
-  async saveLocalValue(value) {
-    return this.saveLocalValues([value]);
-  }
+const Collection = EmberObject.extend({
+  id: '',
+  db: null,
 
-  async saveLocalValues(values) {
-    let meta = await this.meta();
-    let index = meta.next_client_id;
-    let items = values.map(v => {
-      return {
-        value: v,
-        client: meta.client_id,
-        client_index: index++,
-      };
-    });
+  clock: null,
+  items: null,
 
-    let messages = this.tx.objectStore('messages');
-    for (let item of items) {
-      messages.add(item);
-    }
-    this.tx.objectStore('meta').put(index, 'next_client_id');
-    return this.tx.done;
-  }
-}
+  onUpdate: ()=>{},
 
-export default Service.extend({
-  _storep: null,
-  _items: [],
-  _clock: [0,0],
+  init() {
+    this._super(...arguments);
+    this.clock = {local:0,remote:0};
+    this.set('items', []);
 
-  async init() {
-    navigator.serviceWorker.addEventListener('message', (event) => {
-      console.log('update?', event);
-      if (event.data.kind === 'update') {
-        this._update.perform();
-      }
-    });
+    navigator.serviceWorker.addEventListener('message', this.updateHandler);
 
-
-    this._storep = DataStore.open();
-    this._clock = [0,0];
-    this._items = [];
     this._update.perform();
   },
 
-  _update: task(function* () {
-    let store = yield this._storep;
-    let {values, clock} = yield store.read().since(this._clock);
-    this.set('_clock', clock);
-    this.set('_items', this._items.concat(values));
-    console.log(this._items);
-  }).keepLatest(),
-
-  _save: task(function* (message) {
-    let store = yield this._storep;
-    yield store.write().saveLocalValue(message);
-    this._update.perform();
-  }).enqueue(),
-
-  messages: computed('_items', function() {
-    return this._items.sort((a,b) => a.time - b.time);
+  updateHandler: computed(function() {
+    return (event) => {
+      if (event.data && event.data.kind && event.data.kind === 'update') {
+        this._update.perform();
+      }
+    };
   }),
 
-  async save(message) {
-    this._save.perform(message);
+  _update: task(function* () {
+    let {values, clock} = yield getFromCollection(this.db, this.id, this.clock);
+    this.set('clock', clock);
+    this.set('items', this.items.concat(values));
+    this.notifyPropertyChange('items');
+    this.onUpdate();
+  }).keepLatest(),
 
-    navigator.serviceWorker.controller.postMessage({
-      kind: 'update'
-    });
+  save(messages) {
+    if (!Array.isArray(messages)) { throw new Error('pass an array'); }
+    this._save.perform(messages);
+    navigator.serviceWorker.controller.postMessage({kind:'update'});
+  },
+
+  _save: task(function* (messages) {
+    yield writeToCollection(this.db, this.id, messages);
+    return this._update.perform();
+  }).enqueue(),
+
+  willDestroy() {
+    this._super(...arguments);
+    navigator.serviceWorker.removeEventListener('message', this.updateHandler);
+  },
+});
+
+export default Service.extend({
+  async init() {
+    this._dbp = getDB();
+  },
+
+  async collection(id) {
+    let db = await this._dbp;
+    return Collection.create({db,id});
   },
 });
 
 
 window.resetDB = async function() {
-  let db = await openDB('messages', 3);
-  let tx = db.transaction(['meta', 'messages'], 'readwrite');
+  let db = await openDB('messages', DB_VERSION);
+  let tx = db.transaction(['messages', 'clocks'], 'readwrite');
   tx.objectStore('messages').clear();
-
-  let meta = tx.objectStore('meta');
-  meta.put(0, 'next_server_id');
-  meta.put(0, 'next_client_id');
-  meta.put(0, 'next_client_id_to_sync');
+  await tx.objectStore('clocks').clear();
+  tx.objectStore('clocks').add({
+    collection: 'index',
+    synced_remote: 0,
+    synced_local: 0,
+    last_local: 0,
+  });
 
   await tx.done;
   location.reload();
